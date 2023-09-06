@@ -1,42 +1,43 @@
 use std::marker::PhantomData;
 
-use bigdecimal::Num;
-use futures::Stream;
-use sea_query::{Alias, Expr, SelectStatement};
+use bigdecimal::{num_traits::NumCast, Num};
+use sea_query::{Alias, ColumnType, Expr, SelectStatement, SimpleExpr};
 
 use crate::{
     error::*, ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, Select, SelectModel,
-    SelectTwo, SelectTwoModel, Selector, SelectorRaw, SelectorTrait,
+    SelectTwo, SelectTwoModel, Selector, SelectorRaw, SelectorTrait, TryGetable,
+    TryGetableFromJson,
 };
-
-pub type PinBoxStream<'db, Item> = Pin<Box<dyn Stream<Item = Item> + 'db>>;
 
 /// Defined a structure to handle aggregate values from a query on a Model
 #[derive(Clone, Debug)]
-pub struct Aggregator<'db, C, S, T>
+pub struct Aggregator<'db, C, S>
 where
     C: ConnectionTrait,
     S: SelectorTrait + 'db,
-    T: Num,
 {
     pub(crate) query: SelectStatement,
+    pub(crate) db: PhantomData<&'db C>,
     pub(crate) selector: PhantomData<S>,
 }
 
-impl<'db, C, S, T> Aggregator<'db, C, S, T>
+impl<'db, C, S> Aggregator<'db, C, S>
 where
     C: ConnectionTrait,
     S: SelectorTrait + 'db,
 {
-    pub async fn one(&self, db: &'db C) -> Result<T, DbErr> {
+    pub async fn one(&self, db: &'db C) -> Result<S::Item, DbErr> {
         let builder = db.get_database_backend();
         let stmt = builder.build(&self.query);
         let result = match db.query_one(stmt).await? {
             Some(res) => res,
-            None => return Ok(0 as T),
+            None => {
+                return Err(DbErr::Exec(RuntimeErr::Internal(
+                    "Invalid result type from aggregation function sum".to_string(),
+                )))
+            }
         };
-        let num = result.try_get::<T>("", "num")?;
-        Ok(num)
+        S::from_raw_query_result(result)
     }
 }
 
@@ -46,30 +47,117 @@ where
     C: ConnectionTrait,
 {
     type Selector: SelectorTrait + Send + Sync + 'db;
-    type Res: Num;
 
-    fn count<T: ColumnTrait>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
-    fn max<T>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
-    fn min<T>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
-    fn avg<T>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
+    fn sum<T: ColumnTrait>(self, col: T) -> Aggregator<'db, C, Self::Selector>;
+    // fn max<T>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
+    // fn min<T>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
+    // fn avg<T>(self, col: T) -> Aggregator<'db, C, Self::Selector, Self::Res>;
 }
 
-impl<'db, C, S> AggregatorTrait<'db, C> for Selector<S>
+impl<'db, C, M, E> AggregatorTrait<'db, C> for Select<E>
 where
     C: ConnectionTrait,
-    S: SelectorTrait + Send + Sync + 'db,
+    E: EntityTrait<Model = M>,
+    M: FromQueryResult + Sized + Send + Sync + 'db,
 {
-    type Selector = S;
+    type Selector = SelectModel<M>;
 
-    fn count<T: ColumnTrait>(self, col: T) -> Aggregator<'db, C, Self::Selector, u64> {
+    fn sum<T: ColumnTrait>(self, col: T) -> Aggregator<'db, C, Self::Selector> {
+        // match col.def().get_column_type() {
+        //     ColumnType::Float | ColumnType::Double => Ok(()),
+        //     ColumnType::Integer
+        //     | ColumnType::SmallInteger
+        //     | ColumnType::BigInteger
+        //     | ColumnType::TinyInteger => Ok(()),
+        //     ColumnType::Unsigned
+        //     | ColumnType::BigUnsigned
+        //     | ColumnType::TinyUnsigned
+        //     | ColumnType::SmallUnsigned => Ok(()),
+        //     _ => Ok(()),
+        // }
         let query = SelectStatement::new()
-            .expr(Expr::count(col))
-            .from_subquery(self.query.clone(), Alias::new("sub_query"))
+            .expr(Expr::cust(format!(
+                "SUM(\"sub_query\".\"{}\")",
+                col.to_string()
+            )))
+            .from_subquery(self.query.clone().to_owned(), Alias::new("sub_query"))
             .to_owned();
         Aggregator {
             query,
+            db: PhantomData,
             selector: PhantomData,
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "mock")]
+mod tests {
+    use once_cell::sync::Lazy;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+    use crate::entity::prelude::*;
+    use crate::{tests_cfg::*, ConnectionTrait, Statement};
+    use crate::{DatabaseConnection, DbBackend, MockDatabase, Transaction};
+
+    static RAW_STMT: Lazy<Statement> = Lazy::new(|| {
+        Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"SELECT "fruit"."id", "fruit"."name", "fruit"."cake_id" FROM "fruit""#,
+            [],
+        )
+    });
+
+    fn setup() -> (DatabaseConnection, Vec<fruit::Model>) {
+        let page1 = vec![
+            fruit::Model {
+                id: 1,
+                name: "Blueberry".into(),
+                cake_id: Some(1),
+            },
+            fruit::Model {
+                id: 2,
+                name: "Rasberry".into(),
+                cake_id: Some(1),
+            },
+            fruit::Model {
+                id: 3,
+                name: "Strawberry".into(),
+                cake_id: Some(2),
+            },
+        ];
+
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([page1.clone()])
+            .into_connection();
+
+        (db, page1)
+    }
+
+    fn setup_num_items() -> (DatabaseConnection, i64) {
+        let num_items = 3;
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num" => Into::<Value>::into(num_items),
+            }]])
+            .into_connection();
+
+        (db, num_items)
+    }
+
+    #[smol_potat::test]
+    async fn count() -> Result<(), DbErr> {
+        let (db, items) = setup();
+        let builder = db.get_database_backend();
+
+        let aggregator = fruit::Entity::find().sum(fruit::Column::Id);
+        assert_eq!(builder.build(&aggregator.query).to_string(),
+            "SELECT SUM(\"sub_query\".\"id\") FROM (SELECT \"fruit\".\"id\", \"fruit\".\"name\", \"fruit\".\"cake_id\" FROM \"fruit\") AS \"sub_query\"");
+
+        let result = aggregator.one(&db).await?;
+        assert_eq!(result, 6);
+        Ok(())
     }
 }
 
