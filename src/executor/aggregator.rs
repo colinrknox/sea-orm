@@ -4,9 +4,9 @@ use bigdecimal::{num_traits::NumCast, Num};
 use sea_query::{Alias, ColumnType, Expr, SelectStatement, SimpleExpr};
 
 use crate::{
-    error::*, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, Select,
-    SelectModel, SelectTwo, SelectTwoModel, Selector, SelectorRaw, SelectorTrait, TryGetable,
-    TryGetableFromJson,
+    error::*, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryResult,
+    Select, SelectModel, SelectTwo, SelectTwoModel, Selector, SelectorRaw, SelectorTrait,
+    TryGetable, TryGetableFromJson,
 };
 
 /// Defined a structure to handle aggregate values from a query on a Model
@@ -29,16 +29,26 @@ where
     S: SelectorTrait + 'db,
     T: ColumnTrait,
 {
-    pub async fn one(&self, db: &'db C) -> Result<i64, DbErr> {
+    pub async fn one<N: TryGetable + From<i64>>(&self, db: &'db C) -> Result<N, DbErr> {
         let builder = db.get_database_backend();
         let stmt = builder.build(&self.query);
         let result = match db.query_one(stmt).await? {
             Some(res) => res,
-            None => return Ok(0),
+            None => return Ok(N::from(0)),
         };
-        let sum = match builder {
-            _ => result.try_get::<i64>("", "s"),
-        };
+        // let sum = match self.col.def().get_column_type() {
+        //     ColumnType::Float | ColumnType::Double => result.try_get::<f64>("", "s"),
+        //     ColumnType::Integer
+        //     | ColumnType::SmallInteger
+        //     | ColumnType::BigInteger
+        //     | ColumnType::TinyInteger => result.try_get::<i64>("", "s"),
+        //     ColumnType::Unsigned
+        //     | ColumnType::BigUnsigned
+        //     | ColumnType::TinyUnsigned
+        //     | ColumnType::SmallUnsigned => result.try_get::<u64>("", "s"),
+        //     _ => result.try_get::<f64>("", "s"),
+        // };
+        let sum = result.try_get::<N>("", "s");
         sum
     }
 }
@@ -68,18 +78,6 @@ where
     where
         T: ColumnTrait,
     {
-        // match col.def().get_column_type() {
-        //     ColumnType::Float | ColumnType::Double => Ok(()),
-        //     ColumnType::Integer
-        //     | ColumnType::SmallInteger
-        //     | ColumnType::BigInteger
-        //     | ColumnType::TinyInteger => Ok(()),
-        //     ColumnType::Unsigned
-        //     | ColumnType::BigUnsigned
-        //     | ColumnType::TinyUnsigned
-        //     | ColumnType::SmallUnsigned => Ok(()),
-        //     _ => Ok(()),
-        // }
         let query = SelectStatement::new()
             .expr_as(
                 Expr::cust(format!("SUM(\"sub_query\".\"{}\")", col.to_string())),
@@ -171,7 +169,7 @@ mod tests {
         assert_eq!(builder.build(&aggregator.query).to_string(),
             "SELECT SUM(\"sub_query\".\"id\") AS \"s\" FROM (SELECT \"fruit\".\"id\", \"fruit\".\"name\", \"fruit\".\"cake_id\" FROM \"fruit\") AS \"sub_query\"");
 
-        let result = aggregator.one(&db).await?;
+        let result = aggregator.one::<i64>(&db).await?;
         assert_eq!(result, sum);
         Ok(())
     }
